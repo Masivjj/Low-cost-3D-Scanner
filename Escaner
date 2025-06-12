@@ -1,0 +1,620 @@
+//
+/*                                                                            */
+/*  HOW TO UPLOAD TO ESP32:                                                   */
+/*                                                                            */
+/*                                                                            */
+/*  HOW TO RUN:                                                               */
+/*                                                                            */
+/*     1. Connect ESP32 via USB                                               */
+/*     2. Open Serial Monitor at 115200 baud                                  */
+/*     3. Observe “x y z” cloud points being printed as scan proceeds         */
+/*                                                                            */
+//
+//#include <BluetoothSerial.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+/******************************** Definitions *********************************/
+
+#define MICROSTEPS           16
+#define STEPS_PER_REV        200
+#define MICROSTEPS_PER_REV   (MICROSTEPS * STEPS_PER_REV)
+
+#define SLICES_PER_REV       360
+#define STEPS_PER_SLICE      (MICROSTEPS_PER_REV / SLICES_PER_REV)
+
+#define IR_COEF_A            -1.4306917433482826f
+#define IR_COEF_B            5.860031447223213f
+
+#define IR_PIN               6
+#define SAMPLES_PER_SLICE    10
+#define IR_INTERVAL_MS       100
+#define MOV_Y                1     
+
+#define LIMIT_TOP_PIN        7
+#define LIMIT_BOTTOM_PIN     8
+
+#define OLED_DC     9
+#define OLED_CS     10
+#define OLED_RESET  8
+
+
+#define Y_STEP      3
+#define Y_DIR       2
+#define Z_STEP      5
+#define Z_DIR       4
+
+#define BTN_INC     9
+#define BTN_DEC     10
+#define BTN_MODE    11
+
+#define BUZZERPIN    12
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+
+//
+/*  enum MotorState                                                           */
+/*                                                                            */
+/*  Purpose: Defines sub-states for the non-blocking stepper motor FSM        */
+//
+enum MotorState {
+  MOTOR_IDLE,
+  MOTOR_STEP_HIGH,
+  MOTOR_STEP_LOW,
+  MOTOR_DONE
+};
+
+
+
+//
+/*  enum MainState                                                            */
+/*                                                                            */
+/*  Purpose: Defines the main scan and return states                          */
+//
+enum MainState {
+  STATE_RETURN,    /* Initial homing & rapid return */
+  STATE_LINEAR,    /* Raise Y axis one layer at a time */
+  STATE_ROTATE     /* Rotate platform and sample IR sensor */
+};
+
+enum UIState {
+  UI_INICIO,
+  UI_SETUP,
+  UI_DETALLE
+};
+
+struct Note {
+  float tone;
+  int   length;
+};
+
+
+struct Buzzer {
+  int           melody_pin;
+  short         state;
+  int           note;
+  int           melody_size;
+  int           max_cycles;
+  int           cycles;
+  unsigned long previous;
+  unsigned long halfcycle;
+  Note          melody[10];
+};
+
+
+//
+/*  struct Motor                                                              */
+/*                                                                            */
+/*  Purpose: Encapsulates stepper motor control parameters and state          */
+//
+struct Motor {
+  int           stepPin;         /* GPIO pin for STEP signal                  */
+  int           dirPin;          /* GPIO pin for DIRECTION signal             */
+  unsigned long halfPeriodUs;    /* Half period of STEP pulse (µs)            */
+  unsigned long previousMicros;  /* Timestamp of last pulse (micros())        */
+  float         targetSteps;     /* Total microsteps for current command      */
+  float         stepCount;       /* Microsteps issued so far                  */
+  MotorState    state;           /* Current sub-state in Motor FSM            */
+};
+
+
+
+/************************** Global Variables **********************************/   
+//BluetoothSerial SerialBT;
+MainState       mainState      = STATE_RETURN;   /* Start in return/homing state    */
+Motor           motorY, motorZ;            
+float           alturaCm       = 0.0f;         
+bool            pulseHigh      = false;     
+int             slicesDone     = 0;
+Adafruit_SSD1306 display(128, 64, &SPI, OLED_DC, OLED_RESET, OLED_CS);
+
+
+UIState uiState = UI_INICIO;
+
+Buzzer buzz;
+bool lastBtnInc = HIGH, lastBtnDec = HIGH, lastBtnMode = HIGH;
+unsigned long lastUiUpdate = 0;
+
+float R_CM = 14.0f;
+float RPM_Z = 10.0f;
+
+/************************** Function Prototypes ******************************/
+
+
+void setupMotor(Motor &m, int stepPin, int dirPin, float rpm);
+
+
+
+//
+/*  Function: MotorFsm                                                        */
+/*                                                                            */
+/*  Purpose: Advance the motor through its sub-FSM to generate                */
+/*           full revolutions worth of microsteps, non-blocking.              */
+/*                                                                            */
+/*  Parameters:                                                               */
+/*    m      - Reference to the Motor struct                                  */
+/*    vueltas- Number of full revolutions to move (float for fractional)      */
+//
+void MotorFsm(Motor &m, float vueltas);
+
+
+//
+/*  Function: getDistanceFiltered                                             */
+/*                                                                            */
+/*  Purpose: Read SAMPLES_PER_SLICE analog values from IR_PIN, sort them,     */
+/*           discard extremes, average the rest, and apply calibration to     */
+/*           return distance in centimeters.                                  */
+/*                                                                            */
+/*  Returns:                                                                  */
+/*    Distance in cm (float)                                                  */
+//
+float getDistanceFiltered();
+
+void buzzerFSM(Buzzer *buzz);
+
+void setupMelody(Buzzer *buzz, int pin);
+
+void uiLoop(bool homingDone) ;
+//
+/*  Function: setup                                                           */
+/*                                                                            */
+/*  Purpose: Initialize serial, configure GPIOs for endstops and steppers,    */
+/*           perform initial homing of Z axis (motorY) by descending rapidly, */
+/*           and set IR sensor attenuation.                                   */
+//
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LIMIT_TOP_PIN,    INPUT_PULLUP);
+  pinMode(LIMIT_BOTTOM_PIN, INPUT_PULLUP);
+
+  setupMotor(motorY,  Y_STEP, Y_DIR, 25.0f);
+  digitalWrite(motorY.dirPin, LOW);
+  motorY.previousMicros = micros();
+
+  setupMotor(motorZ, Z_STEP, Z_DIR, RPM_Z);
+  setupMelody(&buzz, BUZZERPIN);
+  motorZ.previousMicros = micros();
+  
+  //analogSetPinAttenuation(IR_PIN, ADC_11db);
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("OLED SPI listo");
+  display.display();
+
+  uiSetup();
+
+  //SerialBT.begin("ESP32_G5_");
+}
+
+
+
+//
+/*  Function: loop                                                            */
+/*                                                                            */
+/*  Purpose: Run the main FSM without blocking, cycling through               */
+/*           STATE_RETURN, STATE_LINEAR, and STATE_ROTATE.                    */
+//
+void loop() {
+  unsigned long nowMs = millis();
+  unsigned long nowUs = micros();
+
+  switch (mainState) {
+
+    case STATE_RETURN:
+      if (nowUs - motorY.previousMicros >= motorY.halfPeriodUs) {
+        motorY.previousMicros = nowUs;
+        pulseHigh             = !pulseHigh;
+        digitalWrite(motorY.stepPin, pulseHigh ? HIGH : LOW);
+      }
+      if (digitalRead(LIMIT_BOTTOM_PIN) == LOW) {
+        Serial.write(27);       // ESC
+        Serial.print("[2J");    // Clear screen
+        Serial.write(27);
+        Serial.print("[H");     // Cursor to home
+        Serial.println("------------------------------------");
+        digitalWrite(motorY.dirPin, HIGH);
+        setupMotor(motorY, Y_STEP, Y_DIR, 15.0f);
+        motorY.state = MOTOR_IDLE;
+        alturaCm     = 0.0f;
+        mainState    = STATE_ROTATE;
+      }
+      break;
+
+    case STATE_LINEAR:
+      MotorFsm(motorY, motorY.state == MOTOR_IDLE ? 0.125f * MOV_Y : 0.0f);
+
+      if (digitalRead(LIMIT_TOP_PIN) == LOW) {
+        setupMotor(motorY, Y_STEP, Y_DIR, 25.0f);
+        digitalWrite(motorY.dirPin, LOW);
+        motorY.previousMicros = nowUs;
+        pulseHigh            = false;
+        mainState            = STATE_RETURN;
+      }
+      else if (motorY.state == MOTOR_DONE) {
+        motorY.state  = MOTOR_IDLE;
+        alturaCm     += MOV_Y * 0.1f;
+        mainState     = STATE_ROTATE;
+      }
+      break;
+
+    case STATE_ROTATE:
+      if (slicesDone < SLICES_PER_REV) {
+        if (motorZ.state == MOTOR_IDLE) {
+          MotorFsm(motorZ, 1.0f / SLICES_PER_REV);
+        } else {
+          MotorFsm(motorZ, 0);
+        }
+        if (motorZ.state == MOTOR_DONE) {
+          float d_cm  = getDistanceFiltered();
+          if(d_cm > (R_CM + 5.0f))
+          {
+            float frac  = float(slicesDone) / SLICES_PER_REV;
+            float ang   = frac * TWO_PI;
+            float r_cm  = R_CM - d_cm;
+            float x_cm  = r_cm * cos(ang);
+            float y_cm  = r_cm * sin(ang);
+            float z_cm  = alturaCm;
+            Serial.print(x_cm, 3);
+            Serial.print(" ");
+            Serial.print(y_cm, 3);
+            Serial.print(" ");
+            Serial.println(z_cm, 3);
+
+          }
+
+          slicesDone++;
+          motorZ.state = MOTOR_IDLE;
+        }
+      }
+      else {
+        motorZ.state = MOTOR_IDLE;
+        slicesDone   = 0;
+        mainState    = STATE_LINEAR;
+      }
+    break;
+  }
+
+  //uiLoop(digitalRead(LIMIT_BOTTOM_PIN) == LOW);
+
+}
+
+
+
+//
+/*  Function: setupMotor                                                      */
+/*                                                                            */
+/*  Purpose: Configure step and direction pins for a stepper motor and        */
+/*           calculate its half-step timing based on desired speed.           */
+/*                                                                            */
+/*  Parameters:                                                               */
+/*    m       - Reference to the Motor struct                                 */
+/*    stepPin - GPIO pin number for STEP                                      */
+/*    dirPin  - GPIO pin number for DIRECTION                                 */
+/*    rpm     - If driving angular motor: RPM; if linear motor: mm/s          */
+//
+void setupMotor(Motor &m, int stepPin, int dirPin, float rpm) {
+  m.stepPin = stepPin;  m.dirPin = dirPin;
+  pinMode(stepPin, OUTPUT);
+  pinMode(dirPin, OUTPUT);
+  digitalWrite(stepPin, LOW);
+  digitalWrite(dirPin, HIGH);
+
+  float alpha    = 360.0f / MICROSTEPS_PER_REV;
+  float hzRev    = rpm / 60.0f;
+  float freqHz   = hzRev * MICROSTEPS_PER_REV;
+  m.halfPeriodUs = (unsigned long)((1e6f / freqHz) / 2.0f);
+  m.state        = MOTOR_IDLE;
+  m.stepCount    = 0;
+}
+
+
+
+//
+/*  Function: MotorFsm                                                        */
+/*                                                                            */
+/*  Purpose: Generate non-blocking step pulses to advance the motor by        */
+/*           revolutions (scaled microsteps).                                 */
+/*                                                                            */
+/*  Parameters:                                                               */
+/*    m      - Motor struct reference                                         */
+/*    vueltas- Number of motor revolutions (float allows fractional)          */
+//
+void MotorFsm(Motor &m, float vueltas) {
+  unsigned long now = micros();
+  switch (m.state) {
+    case MOTOR_IDLE:
+      m.targetSteps    = (long)(vueltas * MICROSTEPS_PER_REV);
+      m.stepCount      = -1;
+      m.previousMicros = now;
+      if (m.targetSteps > 0) m.state = MOTOR_STEP_HIGH;
+      break;
+    case MOTOR_STEP_HIGH:
+      if (now - m.previousMicros >= m.halfPeriodUs) {
+        digitalWrite(m.stepPin, HIGH);
+        m.previousMicros = now;
+        m.state = MOTOR_STEP_LOW;
+      }
+      break;
+    case MOTOR_STEP_LOW:
+      if (now - m.previousMicros >= m.halfPeriodUs) {
+        digitalWrite(m.stepPin, LOW);
+        m.previousMicros = now;
+        m.stepCount++;
+        if (m.stepCount >= m.targetSteps) m.state = MOTOR_DONE;
+        else                                m.state = MOTOR_STEP_HIGH;  
+      }
+      break;
+    case MOTOR_DONE:
+      m.state = MOTOR_IDLE;
+      break;
+  }
+}
+
+//
+/*  Function: getDistanceFiltered                                             */
+/*                                                                            */
+/*  Purpose: Take a single ADC sample from the IR sensor each time it’s called*/
+/*           and run it through a simple, low-overhead exponential filter to  */
+/*           smooth noise. Then apply the same power‐law calibration as before*/
+/*                                                                            */
+/*                                                                            */
+/*  Returns:                                                                  */
+/*    Calibrated, filtered distance in centimeters                            */
+//
+/*float getDistanceFiltered() {
+  static int buf[SAMPLES_PER_SLICE];
+  for (int i = 0; i < SAMPLES_PER_SLICE; i++) {
+    buf[i] = analogRead(IR_PIN);
+    delayMicroseconds(200);
+  }
+  for (int i = 0; i < SAMPLES_PER_SLICE - 1; i++) {
+    for (int j = 0; j < SAMPLES_PER_SLICE - 1 - i; j++) {
+      if (buf[j] > buf[j + 1]) {
+        int t = buf[j];
+        buf[j] = buf[j + 1];
+        buf[j + 1] = t;
+      }
+    }
+  }
+  long sum = 0;
+  for (int k = 1; k < SAMPLES_PER_SLICE - 1; k++) {
+    sum += buf[k];
+  }
+  float median = sum / float(SAMPLES_PER_SLICE - 2);
+  return pow(10.0f, IR_COEF_B) * pow(median, IR_COEF_A);
+}*/
+
+float getDistanceFiltered() {
+
+  int raw = analogRead(IR_PIN);
+
+  const float alpha = 0.1f;
+  static float filt = raw;
+  filt = alpha * raw + (1.0f - alpha) * filt;
+
+  float d_cm = pow(10.0f, IR_COEF_B) * pow(filt, IR_COEF_A);
+
+  return d_cm;
+}
+
+/* ================= INIT OLED & buttons ================= */
+void uiSetup() {
+  pinMode(BTN_INC, INPUT_PULLUP);
+  pinMode(BTN_DEC, INPUT_PULLUP);
+  pinMode(BTN_MODE, INPUT_PULLUP);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC)) {
+    while (true); // error
+  }
+
+  display.clearDisplay();
+  display.display();
+}
+
+/* ================= LOOP UI ================= */
+void uiLoop(bool homingDone) {
+  bool nowBtnInc = digitalRead(BTN_INC);
+  bool nowBtnDec = digitalRead(BTN_DEC);
+  bool nowBtnMode = digitalRead(BTN_MODE);
+
+  if (uiState == UI_INICIO && homingDone) {
+    uiState = UI_SETUP;
+    renderSetup();
+  }
+
+  if (lastBtnMode == HIGH && nowBtnMode == LOW && uiState != UI_INICIO) {
+    uiState = (uiState == UI_SETUP) ? UI_DETALLE : UI_SETUP;
+    if (uiState == UI_SETUP) renderSetup();
+    else renderDetalle();
+  }
+
+  if (uiState == UI_SETUP) {
+    if (lastBtnInc == HIGH && nowBtnInc == LOW) {
+      R_CM += 0.1f;
+      renderSetup();
+    }
+    if (lastBtnDec == HIGH && nowBtnDec == LOW) {
+      R_CM = max(0.0f, R_CM - 0.1f);
+      renderSetup();
+    }
+  }
+  else if (uiState == UI_DETALLE) {
+    if (lastBtnInc == HIGH && nowBtnInc == LOW) {
+      RPM_Z = min(50.0f, RPM_Z + 1.0f);
+      RPM_Z = min(50.0f, RPM_Z+ 1.0f);
+      renderDetalle();
+    }
+    if (lastBtnDec == HIGH && nowBtnDec == LOW) {
+      RPM_Z = max(1.0f, RPM_Z - 1.0f);
+      RPM_Z = max(1.0f, RPM_Z- 1.0f);
+      renderDetalle();
+    }
+  }
+
+  if (uiState == UI_INICIO && millis() - lastUiUpdate > 1000) {
+    renderInicio();
+    lastUiUpdate = millis();
+  }
+
+  lastBtnInc = nowBtnInc;
+  lastBtnDec = nowBtnDec;
+  lastBtnMode = nowBtnMode;
+}
+
+/* ================= RENDER: UI_INICIO ================= */
+void renderInicio() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  String txt = "SCANNER 3D";
+  int16_t x, y;
+  uint16_t w, h;
+  display.getTextBounds(txt.c_str(), 0, 0, &x, &y, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, (SCREEN_HEIGHT - h) / 2);
+  display.println(txt);
+  display.display();
+}
+
+/* ================= RENDER: UI_SETUP ================= */
+void renderSetup() {
+  display.clearDisplay();
+  String rTxt = "R: " + String(R_CM, 1) + " cm";
+  display.setTextSize(2);
+  int16_t x, y; uint16_t w, h;
+  display.getTextBounds(rTxt.c_str(), 0, 0, &x, &y, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, 20);
+  display.println(rTxt);
+
+  String instr = "PONGA EL OBJETO EN EL CENTRO";
+  display.setTextSize(1);
+  display.getTextBounds(instr.c_str(), 0, 0, &x, &y, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, SCREEN_HEIGHT - h - 4);
+  display.println(instr);
+
+  display.display();
+}
+
+/* ================= RENDER: UI_DETALLE ================= */
+void renderDetalle() {
+  display.clearDisplay();
+
+  int barWidth = map(RPM_Z, 1, 50, 0, SCREEN_WIDTH - 10);
+  display.drawRect(5, 20, SCREEN_WIDTH - 10, 10, SSD1306_WHITE);
+  display.fillRect(5, 20, barWidth, 10, SSD1306_WHITE);
+
+  String txt = "Detalle " + String(RPM_Z, 1);
+  
+  int16_t x, y; uint16_t w, h;
+  display.setTextSize(1);
+  display.getTextBounds(txt.c_str(), 0, 0, &x, &y, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, 40);
+  display.println(txt);
+  setupMotor(motorZ, 32, 33, RPM_Z);
+  display.display();
+}
+
+
+
+void setupMelody(Buzzer *buzz, int pin) {
+  buzz->melody_pin = pin;
+  buzz->state = 0;
+  buzz->note = 0;
+  buzz->melody_size = sizeof(buzz->melody) / sizeof(Note);
+  buzz->cycles = 0;
+  buzz->max_cycles = 0;
+  buzz->previous = 0;
+  buzz->halfcycle = 0;
+  buzz->melody[0]  = {466.16, 231};  // A#4
+  buzz->melody[1]  = {349.23, 231};  // F4
+  buzz->melody[2]  = {349.23, 231};  // F4
+  buzz->melody[3]  = {466.16, 231};  // A#4
+  buzz->melody[4]  = {415.30, 231};  // G#4
+  buzz->melody[5]  = {369.99, 231};  // F#4
+  buzz->melody[6]  = {415.30, 231};  // G#4
+  buzz->melody[7]  = {466.16, 231};  // A#4
+  buzz->melody[8]  = {369.99, 231};  // F#4
+  buzz->melody[9]  = {369.99, 231};  // F#4
+
+}
+
+void buzzerFSM(Buzzer *buzz) {
+  switch (buzz->state) {
+    case 0:
+      if (buzz->note < buzz->melody_size) {
+        buzz->halfcycle = 1000000 / buzz->melody[buzz->note].tone / 2;
+        buzz->max_cycles = buzz->melody[buzz->note].tone * buzz->melody[buzz->note].length / 1000;
+        buzz->cycles = 0;
+        buzz->previous = micros();
+        buzz->state = 1;
+      } else {
+        buzz->note = 0; 
+        buzz->state = 0;
+      }
+      break;
+
+    case 1:
+      if (buzz->cycles >= buzz->max_cycles) {
+        buzz->previous = millis(); 
+        buzz->state = 4;
+      } else {
+        if (micros() - buzz->previous >= buzz->halfcycle) {
+          digitalWrite(buzz->melody_pin, HIGH);
+          buzz->previous = micros(); 
+          buzz->state = 2;
+        }
+      }
+      break;
+
+    case 2:
+      if (micros() - buzz->previous < buzz->halfcycle) {
+        buzz->state = 2;
+      } else {
+        digitalWrite(buzz->melody_pin, LOW);
+        buzz->previous = micros();
+        buzz->state = 3;
+      }
+      break;
+
+    case 3:
+      if (micros() - buzz->previous < buzz->halfcycle) {
+        buzz->state = 3;
+      } else {
+        buzz->cycles++;
+        buzz->state = 1;
+      }
+      break;
+
+    case 4:
+      if (millis() - buzz->previous >= buzz->melody[buzz->note].length * .5) {
+        buzz->note++;
+        buzz->state = 0;
+      }
+      break;
+  }
+}
